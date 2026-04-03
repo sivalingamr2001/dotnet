@@ -1,0 +1,19 @@
+.sider {
+  min-height: 100vh;
+}
+
+.content {
+  padding: 24px;
+}
+
+.pageWrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.headerRow {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+}

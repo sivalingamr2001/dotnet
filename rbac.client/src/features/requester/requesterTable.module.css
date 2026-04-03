@@ -1,0 +1,7 @@
+.expiringCritical {
+  border-left: 3px solid #ef4444;
+}
+
+.expiringSoon {
+  border-left: 3px solid #eab308;
+}

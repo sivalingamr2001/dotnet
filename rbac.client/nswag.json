@@ -1,0 +1,49 @@
+{
+  "runtime": "Net100",
+  "documentGenerator": {
+    "fromDocument": {
+      "url": "http://localhost:5046/swagger/v1/swagger.json",
+      "output": null
+    }
+  },
+  "codeGenerators": {
+    "openApiToTypeScriptClient": {
+      "className": "RbacApiClient",
+      "moduleName": "",
+      "namespace": "",
+      "typeScriptVersion": 5.0,
+      "template": "Axios",
+      "promiseType": "Promise",
+      "withCredentials": false,
+      "dateTimeType": "Date",
+      "nullValue": "Undefined",
+      "generateClientClasses": true,
+      "generateClientInterfaces": true,
+      "generateOptionalParameters": false,
+      "exportTypes": true,
+      "wrapDtoExceptions": true,
+      "exceptionClass": "ApiException",
+      "useTransformOptionsMethod": false,
+      "useTransformResultMethod": false,
+      "generateDtoTypes": true,
+      "operationGenerationMode": "MultipleClientsFromOperationId",
+      "markOptionalProperties": true,
+      "generateCloneMethod": false,
+      "typeStyle": "Interface",
+      "enumStyle": "Enum",
+      "useLeafType": false,
+      "classTypes": [],
+      "extendedClasses": [],
+      "importRequiredTypes": true,
+      "useGetBaseUrlMethod": false,
+      "baseUrlTokenName": "API_BASE_URL",
+      "queryNullValue": "",
+      "inlineNamedDictionaries": false,
+      "inlineNamedTuples": true,
+      "templateDirectory": null,
+      "serviceHost": null,
+      "serviceSchemes": null,
+      "output": "src/api/generated/rbac.api.ts"
+    }
+  }
+}
