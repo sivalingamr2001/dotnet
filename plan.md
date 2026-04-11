@@ -1,257 +1,436 @@
+import { useState, useCallback, useEffect, createContext, useContext, useMemo, Suspense, lazy } from "react";
 
-You are a senior .NET architect. Scaffold a production-grade ASP.NET Core 8 Web API 
-for an RBAC File/Folder Access Management System using Vertical Slice Architecture 
-with the following full implementation.
+// ============================================================
+// TYPES
+// ============================================================
+const ROLES = { ADMIN: "admin", USER: "user" };
 
-=============================================================
-🗄️ DATABASE — SQLite (dev), Oracle-ready (prod)
-Use EF Core 8 with SQLite. All entities must have audit fields.
-=============================================================
+// ============================================================
+// TOKEN UTILS (mirroring tokenUtils.ts)
+// ============================================================
+function parseToken(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (!payload.sub || !payload.email || !payload.role || !payload.exp) return null;
+    return payload;
+  } catch { return null; }
+}
 
-TABLE: Jan_Emp_Mast_V (read-only view — sync from Oracle, no migrations)
-  - EmpId          (string, PK)
-    - EmpName        (string)
-      - Email          (string)
-        - Username       (string)
-          - PasswordHash   (string)
-            - Department     (string)
-              - Designation    (string)
-                - Role           (string) → values: Requester / HOD / IT
-                  - IsActive       (bool)
+const CLOCK_SKEW = 30_000;
+function isTokenExpired(payload) {
+  return Date.now() >= payload.exp * 1000 - CLOCK_SKEW;
+}
 
-                  TABLE: Jan_Access_Details
-                    - Id             (int, PK, auto-increment)
-                      - FolderNamePath (string) → e.g. /Projects/NPD-2025
-                        - TypeOfAccess   (string) → Read / Read-Write
-                          - ReasonForAccess(string)
-                            - CreatedOn      (DateTime)
-                              - ModifiedOn     (DateTime, nullable)
-                                - CreatedBy      (string → EmpId)
-                                  - ModifiedBy     (string, nullable)
-                                    - ExpiredAt      (DateTime, nullable)
+function validateToken(token) {
+  if (!token) return null;
+  const payload = parseToken(token);
+  if (!payload) return null;
+  if (isTokenExpired(payload)) return null;
+  return payload;
+}
 
-                                    TABLE: Jan_Access_Request
-                                      - Id             (int, PK, auto-increment)
-                                        - EmpId          (string → FK to Jan_Emp_Mast_V)
-                                          - AccessDetailsId(int → FK to Jan_Access_Details)
-                                            - Status         (string) → PendingHOD / PendingIT / Approved / Rejected / Expired / Revoked
-                                              - CreatedOn      (DateTime)
-                                                - ModifiedOn     (DateTime, nullable)
-                                                  - CreatedBy      (string)
-                                                    - ModifiedBy     (string, nullable)
-                                                      - IsAgreed       (bool)
-                                                        - ITSRNumber     (string, nullable)
-                                                          - IsRevoke       (bool, default false)
+function buildFakeJwt(email, role) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    sub: "usr_" + Math.random().toString(36).slice(2),
+    email, role,
+    name: email.split("@")[0],
+    exp: now + 3600,
+    iat: now,
+  };
+  return [
+    btoa(JSON.stringify({ alg: "HS256", typ: "JWT" })),
+    btoa(JSON.stringify(payload)),
+    "fake_sig"
+  ].join(".");
+}
 
-                                                          TABLE: Jan_Access_Approval
-                                                            - Id                  (int, PK, auto-increment)
-                                                              - AccessRequestId     (int → FK to Jan_Access_Request)
-                                                                - EmpId               (string → approver EmpId)
-                                                                  - TypeOfAccessApproval(string) → HOD / IT
-                                                                    - Comments            (string, nullable)
-                                                                      - CreatedOn           (DateTime)
-                                                                        - ModifiedOn          (DateTime, nullable)
-                                                                          - CreatedBy           (string)
-                                                                            - ModifiedBy          (string, nullable)
+// ============================================================
+// AUTH CONTEXT
+// ============================================================
+const AuthContext = createContext(null);
 
-                                                                            TABLE: Jan_Audit_Log (auto-managed, never exposed for edit/delete)
-                                                                              - Id         (int, PK)
-                                                                                - Timestamp  (DateTime)
-                                                                                  - Actor      (string → EmpId)
-                                                                                    - Action     (string) → RequestCreated / HODApproved / HODRejected / ITApproved / ITRejected / AccessGranted / Revoked / Expired
-                                                                                      - ResourceId (int → AccessRequestId)
-                                                                                        - Resource   (string → folder path)
-                                                                                          - Details    (string)
+function AuthProvider({ children }) {
+  const [state, setState] = useState({ user: null, token: null, isLoading: true });
 
-                                                                                          =============================================================
-                                                                                          🔐 AUTH — Login Only (no register)
-                                                                                          =============================================================
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem("demo_token");
+      if (raw) {
+        const payload = validateToken(raw);
+        if (payload) {
+          setState({ user: { id: payload.sub, email: payload.email, role: payload.role, name: payload.name }, token: raw, isLoading: false });
+          return;
+        }
+        sessionStorage.removeItem("demo_token");
+      }
+    } catch {}
+    setState({ user: null, token: null, isLoading: false });
+  }, []);
 
-                                                                                          POST /api/auth/login
-                                                                                            - Accept: { usernameOrEmail, password }
-                                                                                              - Validate against Jan_Emp_Mast_V (match Username or Email + PasswordHash)
-                                                                                                - On success: return JWT token + user details (EmpId, EmpName, Role, Department)
-                                                                                                  - On failure: return 401 with message "Invalid credentials"
-                                                                                                    - JWT: include claims → EmpId, Role, Department
-                                                                                                      - Token expiry: 8 hours
-                                                                                                        - Use BCrypt for password hash verification
+  const login = useCallback(async (email, password) => {
+    await new Promise(r => setTimeout(r, 700));
+    const role = email.includes("admin") ? "admin" : "user";
+    const jwt = buildFakeJwt(email, role);
+    sessionStorage.setItem("demo_token", jwt);
+    const payload = parseToken(jwt);
+    setState({ user: { id: payload.sub, email, role, name: payload.name }, token: jwt, isLoading: false });
+  }, []);
 
-                                                                                                        =============================================================
-                                                                                                        📡 API ENDPOINTS — Vertical Slice Architecture
-                                                                                                        Each feature = its own folder with Command/Query/Handler/Endpoint
-                                                                                                        Use MediatR + FluentValidation + Carter (minimal API routing)
-                                                                                                        =============================================================
+  const logout = useCallback(() => {
+    sessionStorage.removeItem("demo_token");
+    setState({ user: null, token: null, isLoading: false });
+  }, []);
 
-                                                                                                        📁 Features/AccessRequest/
-                                                                                                          POST   /api/access-requests              → CreateAccessRequest (Requester)
-                                                                                                            GET    /api/access-requests/my           → GetMyRequests (Requester — filtered by EmpId from JWT)
-                                                                                                              GET    /api/access-requests/{id}         → GetAccessRequestById
+  const hasRole = useCallback((role) => {
+    if (!state.user) return false;
+    const allowed = Array.isArray(role) ? role : [role];
+    return allowed.includes(state.user.role);
+  }, [state.user]);
 
-                                                                                                              📁 Features/HODApproval/
-                                                                                                                GET    /api/hod/pending                  → GetPendingForHOD (filter by dept)
-                                                                                                                  POST   /api/hod/approve/{requestId}      → HODApprove (sets status → PendingIT, creates Jan_Access_Approval record)
-                                                                                                                    POST   /api/hod/reject/{requestId}       → HODReject (sets status → Rejected, logs reason)
-                                                                                                                      GET    /api/hod/history                  → GetHODApprovalHistory
-                                                                                                                        GET    /api/hod/employee-access/{empId}  → GetEmployeeAccessByEmpId (HOD read-only)
+  const value = useMemo(() => ({
+    ...state,
+    isAuthenticated: !!state.user && !!state.token,
+    login, logout, hasRole
+  }), [state, login, logout, hasRole]);
 
-                                                                                                                        📁 Features/ITApproval/
-                                                                                                                          GET    /api/it/queue                     → GetITPendingQueue
-                                                                                                                            POST   /api/it/approve/{requestId}       → ITApprove (sets status → Approved, sets ExpiredAt = now + 365 days)
-                                                                                                                              POST   /api/it/reject/{requestId}        → ITReject
-                                                                                                                                POST   /api/it/revoke/{requestId}        → RevokeAccess (sets IsRevoke = true, status → Revoked)
-                                                                                                                                  GET    /api/it/active-access             → GetAllActiveAccess
-                                                                                                                                    GET    /api/it/employee-access/{empId}   → GetEmployeeAccessByEmpId (IT with revoke capability)
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
 
-                                                                                                                                    📁 Features/AuditLog/
-                                                                                                                                      GET    /api/audit-logs                   → GetAuditLogs (IT only, filter by action type, paginated)
+function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth outside AuthProvider");
+  return ctx;
+}
 
-                                                                                                                                      📁 Features/Dashboard/
-                                                                                                                                        GET    /api/dashboard/requester          → requester stats
-                                                                                                                                          GET    /api/dashboard/hod               → HOD stats
-                                                                                                                                            GET    /api/dashboard/it                → IT stats + expiring soon count
+// ============================================================
+// DESIGN TOKENS
+// ============================================================
+const C = {
+  bg: "#0b0e14",
+  surface: "#111520",
+  surfaceAlt: "#161c2a",
+  border: "#1e2535",
+  borderBright: "#2a3450",
+  accent: "#3b82f6",
+  accentDim: "#1d3a6e",
+  accentGlow: "rgba(59,130,246,0.15)",
+  success: "#10b981",
+  successDim: "#064e3b",
+  danger: "#ef4444",
+  dangerDim: "#450a0a",
+  warn: "#f59e0b",
+  warnDim: "#451a03",
+  text: "#e2e8f0",
+  textMuted: "#64748b",
+  textDim: "#374151",
+  admin: "#a855f7",
+  adminDim: "#2e1065",
+};
 
-                                                                                                                                            =============================================================
-                                                                                                                                            ⚙️ BACKGROUND SERVICE
-                                                                                                                                            =============================================================
+const F = {
+  mono: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+  sans: "'DM Sans', 'Inter', system-ui, sans-serif",
+};
 
-                                                                                                                                            Implement IHostedService → AccessExpiryBackgroundService:
-                                                                                                                                              - Runs daily at midnight
-                                                                                                                                                - Query all Jan_Access_Request where Status = Approved AND ExpiredAt <= DateTime.UtcNow
-                                                                                                                                                  - For each: set Status = Expired, IsRevoke = false
-                                                                                                                                                    - Insert row in Jan_Audit_Log with Action = Expired
-                                                                                                                                                      - Log using ILogger
+// ============================================================
+// SHARED UI PRIMITIVES
+// ============================================================
+function Badge({ children, color = C.accent, bg = C.accentDim }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "2px 8px", borderRadius: "4px", fontSize: "11px", fontWeight: 600, fontFamily: F.mono, color, background: bg, border: `1px solid ${color}30`, letterSpacing: "0.05em", textTransform: "uppercase" }}>
+      {children}
+    </span>
+  );
+}
 
-                                                                                                                                                      =============================================================
-                                                                                                                                                      🏗️ PROJECT STRUCTURE
-                                                                                                                                                      =============================================================
+function Tag({ children, type = "info" }) {
+  const map = {
+    info: [C.accent, C.accentDim],
+    success: [C.success, C.successDim],
+    danger: [C.danger, C.dangerDim],
+    warn: [C.warn, C.warnDim],
+    admin: [C.admin, C.adminDim],
+  };
+  const [color, bg] = map[type] || map.info;
+  return <Badge color={color} bg={bg}>{children}</Badge>;
+}
 
-                                                                                                                                                      src/
-                                                                                                                                                        RBAC.Api/
-                                                                                                                                                            Features/
-                                                                                                                                                                  Auth/
-                                                                                                                                                                          LoginCommand.cs
-                                                                                                                                                                                  LoginHandler.cs
-                                                                                                                                                                                          LoginEndpoint.cs
-                                                                                                                                                                                                  LoginValidator.cs
-                                                                                                                                                                                                        AccessRequest/
-                                                                                                                                                                                                                CreateAccessRequest/
-                                                                                                                                                                                                                        GetMyRequests/
-                                                                                                                                                                                                                                GetAccessRequestById/
-                                                                                                                                                                                                                                      HODApproval/
-                                                                                                                                                                                                                                              GetPending/
-                                                                                                                                                                                                                                                      Approve/
-                                                                                                                                                                                                                                                              Reject/
-                                                                                                                                                                                                                                                                      History/
-                                                                                                                                                                                                                                                                              EmployeeLookup/
-                                                                                                                                                                                                                                                                                    ITApproval/
-                                                                                                                                                                                                                                                                                            Queue/
-                                                                                                                                                                                                                                                                                                    Approve/
-                                                                                                                                                                                                                                                                                                            Reject/
-                                                                                                                                                                                                                                                                                                                    Revoke/
-                                                                                                                                                                                                                                                                                                                            ActiveAccess/
-                                                                                                                                                                                                                                                                                                                                    EmployeeLookup/
-                                                                                                                                                                                                                                                                                                                                          AuditLog/
-                                                                                                                                                                                                                                                                                                                                                Dashboard/
-                                                                                                                                                                                                                                                                                                                                                    Infrastructure/
-                                                                                                                                                                                                                                                                                                                                                          Persistence/
-                                                                                                                                                                                                                                                                                                                                                                  AppDbContext.cs
-                                                                                                                                                                                                                                                                                                                                                                          Configurations/ (IEntityTypeConfiguration per table)
-                                                                                                                                                                                                                                                                                                                                                                                BackgroundServices/
-                                                                                                                                                                                                                                                                                                                                                                                        AccessExpiryBackgroundService.cs
-                                                                                                                                                                                                                                                                                                                                                                                              Middleware/
-                                                                                                                                                                                                                                                                                                                                                                                                      ExceptionHandlingMiddleware.cs
-                                                                                                                                                                                                                                                                                                                                                                                                          Domain/
-                                                                                                                                                                                                                                                                                                                                                                                                                Entities/
-                                                                                                                                                                                                                                                                                                                                                                                                                        AccessRequest.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                AccessDetails.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                        AccessApproval.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                AuditLog.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                        EmpMast.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                              Enums/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                      AccessStatus.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ApprovalType.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      AuditAction.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          Common/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                Extensions/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ClaimsPrincipalExtensions.cs (GetEmpId, GetRole)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              Responses/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ApiResponse.cs (generic wrapper)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              PagedResponse.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    Behaviours/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ValidationBehaviour.cs (MediatR pipeline)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    LoggingBehaviour.cs
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        Program.cs
+function CodeLine({ label, value, type = "info" }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 0", borderBottom: `1px solid ${C.border}` }}>
+      <span style={{ color: C.textMuted, fontFamily: F.mono, fontSize: "11px", minWidth: "110px" }}>{label}</span>
+      <Tag type={type}>{value}</Tag>
+    </div>
+  );
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        =============================================================
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        📦 NUGET PACKAGES
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        =============================================================
+function Button({ children, onClick, variant = "primary", small, disabled }) {
+  const styles = {
+    primary: { bg: C.accent, color: "#fff", border: C.accent },
+    ghost: { bg: "transparent", color: C.textMuted, border: C.border },
+    danger: { bg: "transparent", color: C.danger, border: C.danger },
+  };
+  const s = styles[variant];
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        padding: small ? "6px 14px" : "10px 20px",
+        background: s.bg, color: s.color,
+        border: `1px solid ${s.border}`,
+        borderRadius: "6px", cursor: disabled ? "not-allowed" : "pointer",
+        fontFamily: F.mono, fontSize: small ? "11px" : "13px",
+        fontWeight: 600, letterSpacing: "0.04em",
+        opacity: disabled ? 0.5 : 1,
+        transition: "all 0.15s",
+      }}
+    >{children}</button>
+  );
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          - Microsoft.EntityFrameworkCore.Sqlite
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            - Microsoft.EntityFrameworkCore.Design
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              - MediatR
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                - FluentValidation.AspNetCore
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  - Carter
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    - Microsoft.AspNetCore.Authentication.JwtBearer
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - BCrypt.Net-Next
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        - Serilog.AspNetCore
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          - Serilog.Sinks.Console
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            - Serilog.Sinks.File
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              - Swashbuckle.AspNetCore (Swagger with JWT support)
+// ============================================================
+// ROUTER SIMULATION (no react-router in artifacts, simulating the pattern)
+// ============================================================
+const RouterContext = createContext(null);
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              =============================================================
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ✅ BEST PRACTICES (2026)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              =============================================================
+function RouterProvider({ children }) {
+  const [currentPath, setCurrentPath] = useState("/dashboard");
+  const navigate = useCallback((path) => setCurrentPath(path), []);
+  return (
+    <RouterContext.Provider value={{ currentPath, navigate }}>
+      {children}
+    </RouterContext.Provider>
+  );
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                - Minimal APIs via Carter (no Controllers)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  - Vertical Slice — no shared service layer
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    - MediatR for CQRS (Commands + Queries separated)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - FluentValidation pipeline behaviour (auto-validates before handler)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        - ApiResponse<T> wrapper on all endpoints: { success, data, message, errors }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          - Global exception middleware — never expose stack traces
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            - Role-based authorization via [Authorize(Roles = "HOD")] on endpoints
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              - JWT claims used to scope data (HOD sees only their dept, Requester sees only their own)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                - All DateTime in UTC
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  - EF Core — no lazy loading, explicit Include() only
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    - Audit fields (CreatedOn, CreatedBy, ModifiedOn, ModifiedBy) auto-set via SaveChanges override in AppDbContext
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - Serilog structured logging with request/response logging middleware
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        - Swagger UI with Bearer token input enabled
+function useRouter() {
+  return useContext(RouterContext);
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        =============================================================
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ⚛️ REACT FRONTEND — BASE SCAFFOLD ONLY
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        =============================================================
+// ============================================================
+// PROTECTED ROUTE LOGIC (mirroring ProtectedRoute.tsx)
+// ============================================================
+function ProtectedRoute({ allowedRoles, children }) {
+  const { isAuthenticated, isLoading, hasRole } = useAuth();
+  const { navigate } = useRouter();
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        Create a Vite + React + TypeScript project:
+  if (isLoading) return <AuthLoadingScreen />;
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        src/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          api/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              axiosInstance.ts     → base URL, JWT interceptor (attach token), 401 redirect
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  auth.api.ts          → login endpoint call
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    context/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        AuthContext.tsx      → store user (EmpId, EmpName, Role), login(), logout()
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          pages/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              LoginPage.tsx        → Ant Design Form, username/email + password, calls login API
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                routes/
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    AppRouter.tsx        → React Router v6, ProtectedRoute by role
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      App.tsx
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        main.tsx
+  if (!isAuthenticated) {
+    // In real app: <Navigate to="/login" state={{ from: location }} replace />
+    return <RedirectCard to="/login" reason="unauthenticated" />;
+  }
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        Do NOT implement any other pages — backend is the full deliverable.
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        React is base scaffold only.
+  if (allowedRoles?.length && !hasRole(allowedRoles)) {
+    return <AccessDeniedCard requiredRoles={allowedRoles} />;
+  }
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        =============================================================
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        🌱 SEED DATA (SQLite dev)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        =============================================================
+  return children;
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        In AppDbContext.OnModelCreating or a SeedData.cs class, seed:
+// ============================================================
+// LOADING / ACCESS DENIED (mirroring ProtectedRoute.tsx screens)
+// ============================================================
+function AuthLoadingScreen() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "260px", gap: "14px" }}>
+      <div style={{ width: "28px", height: "28px", border: `2px solid ${C.border}`, borderTopColor: C.accent, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+      <span style={{ color: C.textMuted, fontFamily: F.mono, fontSize: "12px", letterSpacing: "0.1em" }}>Verifying session...</span>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        Jan_Emp_Mast_V (as a normal table for dev, Oracle view in prod):
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          - EMP001 | Shiva Kumar   | shiva@janatics.com   | shiva   | [bcrypt hash of "Pass@123"] | Engineering | Developer       | Requester
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            - EMP002 | Anita Rao     | anita@janatics.com   | anita   | [bcrypt hash of "Pass@123"] | Finance     | Analyst         | Requester
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              - EMP003 | Karthik M     | karthik@janatics.com | karthik | [bcrypt hash of "Pass@123"] | R&D         | Engineer        | Requester
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                - HOD001 | Rajan S       | rajan@janatics.com   | rajan   | [bcrypt hash of "Pass@123"] | Engineering | Head of Dept    | HOD
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  - IT001  | Priya T       | priya@janatics.com   | priya   | [bcrypt hash of "Pass@123"] | IT          | IT Analyst      | IT
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ```
+function RedirectCard({ to, reason }) {
+  const { navigate } = useRouter();
+  return (
+    <div style={{ padding: "32px", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: "16px" }}>
+      <div style={{ width: "52px", height: "52px", borderRadius: "50%", background: C.warnDim, border: `1px solid ${C.warn}40`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px" }}>🔀</div>
+      <div>
+        <div style={{ color: C.warn, fontFamily: F.mono, fontSize: "13px", fontWeight: 700, marginBottom: "4px" }}>Redirect Triggered</div>
+        <div style={{ color: C.textMuted, fontSize: "12px", fontFamily: F.mono }}>
+          Reason: <Tag type="warn">{reason}</Tag>
+        </div>
+        <div style={{ color: C.textMuted, fontSize: "12px", fontFamily: F.mono, marginTop: "4px" }}>
+          {'→'} Navigate to: <Tag type="warn">{to}</Tag>
+        </div>
+      </div>
+      <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "12px 16px", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, textAlign: "left", maxWidth: "340px", lineHeight: 1.7 }}>
+        <span style={{ color: C.textDim }}>// ProtectedRoute.tsx</span><br/>
+        <span style={{ color: "#7dd3fc" }}>if</span> (!isAuthenticated) {'{'}<br/>
+        &nbsp;&nbsp;<span style={{ color: "#7dd3fc" }}>return</span> {"<"}Navigate to<span style={{ color: C.warn }}>=</span><span style={{ color: "#86efac" }}>"/login"</span><br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;state<span style={{ color: C.warn }}>=</span>{'{{ from: location }}'}<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;replace {"/>"}<br/>
+        {'}'}
+      </div>
+      <Button small onClick={() => navigate("/login")}>Go to Login</Button>
+    </div>
+  );
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ---
+function AccessDeniedCard({ requiredRoles }) {
+  return (
+    <div style={{ padding: "32px", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: "16px" }}>
+      <div style={{ width: "52px", height: "52px", borderRadius: "50%", background: C.dangerDim, border: `1px solid ${C.danger}40`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px" }}>⛔</div>
+      <div>
+        <div style={{ color: C.danger, fontFamily: F.mono, fontSize: "13px", fontWeight: 700, marginBottom: "4px" }}>Access Denied</div>
+        <div style={{ color: C.textMuted, fontSize: "12px", fontFamily: F.mono }}>
+          Required role: {requiredRoles.map(r => <Tag key={r} type="admin">{r}</Tag>)}
+        </div>
+      </div>
+      <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "12px 16px", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, textAlign: "left", maxWidth: "340px", lineHeight: 1.7 }}>
+        <span style={{ color: C.textDim }}>// ProtectedRoute.tsx</span><br/>
+        <span style={{ color: "#7dd3fc" }}>if</span> (allowedRoles && !hasRole(allowedRoles)) {'{'}<br/>
+        &nbsp;&nbsp;<span style={{ color: "#7dd3fc" }}>return</span> {"<"}AccessDenied<br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;requiredRoles<span style={{ color: C.warn }}>=</span>{"{allowedRoles}"} {"/>"}<br/>
+        {'}'}
+      </div>
+    </div>
+  );
+}
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  Paste this directly into **GitHub Copilot Chat** (`Ctrl+Shift+I`) or **Copilot Edits** in VS Code with your solution folder open. Start with `@workspace /new` if scaffolding from scratch, or follow up feature-by-feature with `@workspace implement the HODApproval feature slice`.
+// ============================================================
+// PAGE COMPONENTS
+// ============================================================
+function LoginPage() {
+  const { login, isAuthenticated } = useAuth();
+  const { navigate } = useRouter();
+  const [email, setEmail] = useState("user@example.com");
+  const [password, setPassword] = useState("password");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  if (isAuthenticated) {
+    return (
+      <div style={{ padding: "32px", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: "12px" }}>
+        <div style={{ color: C.success, fontFamily: F.mono, fontSize: "13px" }}>Already authenticated → redirect to /dashboard</div>
+        <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "12px 16px", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, textAlign: "left", lineHeight: 1.7 }}>
+          <span style={{ color: C.textDim }}>// Router.tsx — PublicOnlyRoute</span><br/>
+          <span style={{ color: "#7dd3fc" }}>if</span> (isAuthenticated) {'{'}<br/>
+          &nbsp;&nbsp;<span style={{ color: "#7dd3fc" }}>return</span> {"<"}Navigate to<span style={{ color: C.warn }}>=</span><span style={{ color: "#86efac" }}>"/dashboard"</span> replace {"/>"}<br/>
+          {'}'}
+        </div>
+        <Button small onClick={() => navigate("/dashboard")}>Go to Dashboard</Button>
+      </div>
+    );
+  }
+
+  async function handleLogin() {
+    if (!email) { setError("Email required"); return; }
+    setError(""); setLoading(true);
+    try {
+      await login(email, password);
+      navigate("/dashboard");
+    } catch { setError("Login failed."); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div style={{ padding: "28px", display: "flex", flexDirection: "column", gap: "16px" }}>
+      <div style={{ marginBottom: "4px" }}>
+        <div style={{ fontFamily: F.mono, fontSize: "11px", color: C.textDim, marginBottom: "2px" }}>// pages/LoginPage.tsx</div>
+        <div style={{ color: C.text, fontFamily: F.sans, fontSize: "18px", fontWeight: 700 }}>Sign In</div>
+        <div style={{ color: C.textMuted, fontSize: "12px", fontFamily: F.mono, marginTop: "4px" }}>
+          Try <Tag type="info">user@example.com</Tag> or <Tag type="admin">admin@example.com</Tag>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+        <div>
+          <label style={{ display: "block", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, marginBottom: "4px" }}>EMAIL</label>
+          <input value={email} onChange={e => setEmail(e.target.value)}
+            style={{ width: "100%", background: C.surfaceAlt, border: `1px solid ${C.borderBright}`, borderRadius: "6px", padding: "8px 12px", color: C.text, fontFamily: F.mono, fontSize: "13px", outline: "none", boxSizing: "border-box" }} />
+        </div>
+        <div>
+          <label style={{ display: "block", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, marginBottom: "4px" }}>PASSWORD</label>
+          <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+            style={{ width: "100%", background: C.surfaceAlt, border: `1px solid ${C.borderBright}`, borderRadius: "6px", padding: "8px 12px", color: C.text, fontFamily: F.mono, fontSize: "13px", outline: "none", boxSizing: "border-box" }} />
+        </div>
+      </div>
+
+      {error && <div style={{ color: C.danger, fontFamily: F.mono, fontSize: "11px" }}>{error}</div>}
+
+      <Button onClick={handleLogin} disabled={loading}>
+        {loading ? "Authenticating..." : "Login"}
+      </Button>
+
+      <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "12px", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, lineHeight: 1.7 }}>
+        <span style={{ color: C.textDim }}>// After login, redirect to original destination:</span><br/>
+        <span style={{ color: "#7dd3fc" }}>const</span> from = location.state?.from?.pathname ?? <span style={{ color: "#86efac" }}>"/dashboard"</span><br/>
+        navigate(from, {'{ replace: true }'})<br/>
+        <span style={{ color: C.textDim }}>// Token stored → validated on next page load</span>
+      </div>
+    </div>
+  );
+}
+
+function DashboardPage() {
+  const { user, token } = useAuth();
+  const payload = token ? parseToken(token) : null;
+  const expiresIn = payload ? Math.floor((payload.exp * 1000 - Date.now()) / 60000) : 0;
+
+  return (
+    <div style={{ padding: "28px", display: "flex", flexDirection: "column", gap: "20px" }}>
+      <div>
+        <div style={{ fontFamily: F.mono, fontSize: "11px", color: C.textDim, marginBottom: "2px" }}>// pages/DashboardPage.tsx</div>
+        <div style={{ color: C.text, fontFamily: F.sans, fontSize: "18px", fontWeight: 700 }}>Dashboard</div>
+        <div style={{ color: C.textMuted, fontFamily: F.mono, fontSize: "11px", marginTop: "4px" }}>Protected route — any authenticated user</div>
+      </div>
+
+      <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "16px" }}>
+        <div style={{ fontFamily: F.mono, fontSize: "11px", color: C.textDim, marginBottom: "10px" }}>AUTH STATE</div>
+        <CodeLine label="user.name" value={user?.name} type="success" />
+        <CodeLine label="user.email" value={user?.email} type="info" />
+        <CodeLine label="user.role" value={user?.role} type={user?.role === "admin" ? "admin" : "success"} />
+        <CodeLine label="token.valid" value="true" type="success" />
+        <CodeLine label="expires_in" value={`~${expiresIn}m`} type="warn" />
+      </div>
+
+      <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "12px 16px", fontFamily: F.mono, fontSize: "11px", color: C.textMuted, lineHeight: 1.7 }}>
+        <span style={{ color: C.textDim }}>// Router.tsx — protected section</span><br/>
+        {"<"}Route element={"{<"}ProtectedRoute {""/>}"}>{"}"}<br/>
+        &nbsp;&nbsp;{"<"}Route path<span style={{ color: C.warn }}>=</span><span style={{ color: "#86efac" }}>"/dashboard"</span><br/>
+        &nbsp;&nbsp;&nbsp;&nbsp;element<span style={{ color: C.warn }}>=</span>{"{<"}DashboardPage {"/>}"} {"/>"}<br/>
+        {"</"}Route{">"}
+      </div>
+    </div>
+  );
+}
+
+function ProfilePage() {
+  const { user } = useAuth();
+  return (
+    <div style={{ padding: "28px", display: "flex", flexDirection: "column", gap: "16px" }}>
+      <div>
+        <div style={{ fontFamily: F.mono, fontSize: "11px", color: C.textDim, marginBottom: "2px" }}>// pages/ProfilePage.tsx</div>
+        <div style={{ color: C.text, fontFamily: F.sans, fontSize: "18px", fontWeight: 700 }}>Profile</div>
+        <div style={{ color: C.textMuted, fontFamily: F.mono, fontSize: "11px", marginTop: "4px" }}>Protected route — any authenticated user</div>
+      </div>
+      <div style={{ background: C.surfaceAlt, border: `1px solid ${C.border}`, borderRadius: "8px", padding: "16px" }}>
+        <CodeLine label="id" value={user?.id?.slice(0, 14) + "..."} type="info" />
+        <CodeLine label="name" value={user?.name} type="success" />
+        <CodeLine label="role" value={user?.role} type={user?.role === "admin" ? "admin" : "success"} />
+      </div>
+    </div>
+  );
+}
+
+function AdminPage() {
+  return (
+    <div style={{ padding: "28px", display: "flex", flexDirection: "column", gap: "16px" }}>
+      <div>
+        <div style={{ fontFamily: F.mono, fontSize: "11px", color: C.textDim, marginBottom: "2px" }}>// pages/AdminPage.tsx</div>
+        <div style={{ color: C.text, fontFamily: F.sans, fontSize: "18px", fontWeight: 700 }}>Admin Panel</div>
+        <div style={{ color: C.textMuted, fontFamily: F.mono, fontSize: "11px", marginTop: "4px" }}>
+          Role-gated: <Tag type="admin">admin only</Tag>
+        </div>
+      </div>
+      <div style={{ background: "#1a0e2e", border: `1px solid ${C.admin}30`, borderRadius: "8px", padding: "16px" }}>
+        <div style={{ color: C.admin, fontFamily: F.mono, fontSize: "12px", marginBottom: "8px" }}>✦ ADMIN ACCESS GRANTED</div>
+        <div style={{ color: C.textMuted, fontFamily: F.mono, fontSize: "11px", lineHeight: 1.8 }}>
+          You can manage users, roles, and system config here.
+        </di
